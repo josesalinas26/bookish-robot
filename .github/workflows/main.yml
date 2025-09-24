@@ -2,8 +2,8 @@ name: via
 
 on:
   schedule:
-    # Run every 3 hours (at minute 0)
-    - cron: "0 */3 * * *"
+    # Run every 4 hours (at minute 0)
+    - cron: "0 */4 * * *"
   workflow_dispatch:
 
 # Ensure only one workflow run executes at a time across the repo.
@@ -66,65 +66,115 @@ jobs:
           ./via.sh "$WORKER_ID"
 
   cleanup-queued-jobs:
-    # single runner job — will run in parallel with the matrix jobs
     runs-on: ubuntu-latest
-    needs: []
-    # Run immediately in parallel, but script will sleep 10s before taking action.
+    # run in parallel with matrix (no needs:)
     steps:
-      - name: Wait 10s for jobs to be scheduled
+      - name: Wait for scheduling
         run: sleep 10
 
-      - name: Install jq (for JSON parsing)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+      - name: Install jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
 
-      - name: Cancel queued jobs in this run (keep in_progress)
+      - name: Cancel queued jobs (robust)
         env:
           GITHUB_API_URL: https://api.github.com
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN_GITHUB: ${{ github.token }}
+          TOKEN_PAT: ${{ secrets.ACTIONS_PAT || '' }}
         run: |
-          echo "Listing jobs for run $RUN_ID in $REPO..."
-          # fetch up to 100 jobs (should be enough for this workflow)
-          resp="$(curl -sS -H "Accept: application/vnd.github+json" \
-                        -H "Authorization: Bearer $TOKEN" \
-                        -H "X-GitHub-Api-Version: 2022-11-28" \
-                        "$GITHUB_API_URL/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
+          set -euo pipefail
+          token_to_use="$TOKEN_GITHUB"
 
-          echo "$resp" | jq '.total_count as $c | "total jobs: \($c)"'
+          # function to list jobs for the run, returns JSON
+          list_jobs() {
+            curl -sS -H "Accept: application/vnd.github+json" \
+                 -H "Authorization: Bearer $token_to_use" \
+                 -H "X-GitHub-Api-Version: 2022-11-28" \
+                 "$GITHUB_API_URL/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=200"
+          }
 
-          # extract job ids that are queued
-          queued_ids=$(echo "$resp" | jq -r '.jobs[] | select(.status == "queued") | .id')
+          # Try 3 times to fetch the jobs (small backoff)
+          attempt=0
+          resp=""
+          while [ $attempt -lt 3 ]; do
+            attempt=$((attempt+1))
+            resp=$(list_jobs) || resp=""
+            # crude check if we got JSON with jobs
+            if echo "$resp" | jq -e '.jobs' >/dev/null 2>&1; then
+              break
+            fi
+            echo "Attempt $attempt to list jobs failed or returned no jobs; sleeping 3s and retrying..."
+            sleep 3
+          done
 
-          if [ -z "$queued_ids" ]; then
-            echo "No queued jobs found. Nothing to cancel."
+          if [ -z "$resp" ]; then
+            echo "Failed to list jobs after retries; aborting cleanup step (no cancels attempted)."
             exit 0
           fi
 
-          echo "Queued job ids to cancel:"
+          total=$(echo "$resp" | jq -r '.total_count // 0')
+          echo "total jobs: $total"
+
+          # collect queued jobs that are still queued (and not completed)
+          queued_ids=$(echo "$resp" | jq -r '.jobs[] | select(.status == "queued" and (.conclusion == null or .conclusion == "")) | .id')
+
+          if [ -z "$queued_ids" ]; then
+            echo "No queued jobs to cancel. Done."
+            exit 0
+          fi
+
+          echo "Queued job ids to attempt cancel on:"
           echo "$queued_ids"
 
-          # cancel each queued job
-          for jid in $queued_ids; do
-            echo "Cancelling job id $jid ..."
-            http_status=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+          # helper to call cancel and return HTTP status and body
+          cancel_job() {
+            local jid=$1
+            http_status=$(curl -sS -w "%{http_code}" -o /tmp/cancel_body.json -X POST \
               -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $TOKEN" \
+              -H "Authorization: Bearer $token_to_use" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$REPO/actions/jobs/$jid/cancel")
+            echo "$http_status"
+          }
 
-            if [ "$http_status" -eq 202 ] || [ "$http_status" -eq 204 ]; then
-              echo "Cancel request accepted for job $jid (status $http_status)."
+          # Try canceling each queued job. If we see consistent permission/404 failures,
+          # and a PAT secret exists, retry the entire cancel sequence with the PAT.
+          failed_ok=0
+          any_failed=0
+          for jid in $queued_ids; do
+            echo "Attempting cancel for job id $jid ..."
+            status=$(cancel_job "$jid")
+            if [ "$status" = "202" ] || [ "$status" = "204" ]; then
+              echo "Cancel request accepted for job $jid (HTTP $status)."
             else
-              echo "Cancel request for job $jid returned HTTP $http_status. Body:"
-              curl -sS -X POST \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer $TOKEN" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "$GITHUB_API_URL/repos/$REPO/actions/jobs/$jid/cancel" || true
+              echo "Cancel request for job $jid returned HTTP $status. Response body:"
+              cat /tmp/cancel_body.json || true
+              any_failed=1
             fi
           done
 
-          echo "Cleanup finished."
+          # If any cancel failed and we have a PAT, try again with PAT once
+          if [ "$any_failed" -eq 1 ] && [ -n "$TOKEN_PAT" ]; then
+            echo "Some cancels failed. Retrying cancels using repo PAT..."
+            token_to_use="$TOKEN_PAT"
+            # re-list jobs (maybe some changed) and cancel remaining queued ones
+            resp2=$(list_jobs)
+            queued_ids2=$(echo "$resp2" | jq -r '.jobs[] | select(.status == "queued" and (.conclusion == null or .conclusion == "")) | .id')
+            if [ -n "$queued_ids2" ]; then
+              for jid in $queued_ids2; do
+                echo "Retry cancel with PAT for job id $jid ..."
+                status=$(cancel_job "$jid")
+                if [ "$status" = "202" ] || [ "$status" = "204" ]; then
+                  echo "Cancel accepted for job $jid (HTTP $status)."
+                else
+                  echo "Cancel returned HTTP $status with body:"
+                  cat /tmp/cancel_body.json || true
+                fi
+              done
+            else
+              echo "No queued jobs found on retry with PAT."
+            fi
+          fi
+
+          echo "Cleanup run complete."
